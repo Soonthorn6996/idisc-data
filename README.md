@@ -196,6 +196,48 @@ All optional, via environment variables:
 | `SEC_BULK_MAX_SYMBOLS` | `50` | Max tickers per bulk request |
 | `SEC_BULK_CONCURRENCY` | `2` | Bulk fan-out width |
 
+## Deployment (Railway)
+
+Live: **https://idisc-data-production.up.railway.app** — docs at `/docs`.
+
+Config lives in `railway.json`; `railway up` deploys the working directory.
+
+```bash
+railway up
+```
+
+### Single worker and single replica is a correctness requirement
+
+`railway.json` pins `--workers 1` and `numReplicas: 1`. This is **not** a cost
+choice. The rate limiter and the TTL caches are both in-process, so every extra
+worker or replica keeps its own limiter and its own cache. Two replicas means
+double the request rate against `market.sec.or.th` and half the cache hit rate —
+which trips the bot defence the limiter exists to prevent.
+
+To scale beyond one instance you first need shared state: move the limiter and
+caches to Redis, then raise the replica count. Raising it alone will cause 503s.
+
+Consequences of in-process caching, worth knowing:
+
+- Caches are cold after every redeploy; the first `/api/v1/symbols` call re-crawls
+  the A–Z index (~29 s measured in production).
+- `POST /admin/cache/clear` affects only the instance that serves the request.
+
+### Verified in production
+
+| Check | Result |
+|---|---|
+| `/health`, `/`, `/docs` | 200 |
+| `/api/v1/sustainability/GULF` | 200 — CG 5/5, AGM 5/5, Thai-CAC certified, ESG AA |
+| `/api/v1/form59/GULF` | 200 — 29/29 rows, `parse_complete: true` |
+| `/api/v1/symbols` | 200 — 866 companies (SET 637 / mai 229) in 28.8 s |
+| Unknown ticker / bad date | 404 / 422 with Thai messages |
+
+The SEC portal serves Railway's datacenter IP without a bot challenge. That is
+not guaranteed to hold — if 503s with `Retry-After` start appearing, raise
+`SEC_MIN_REQUEST_INTERVAL` in the Railway service variables rather than retrying
+harder.
+
 ## Tests
 
 ```bash
