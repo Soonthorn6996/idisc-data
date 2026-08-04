@@ -115,7 +115,21 @@ buy/sell from transfers, gifts and inheritances. A 550,000-share intra-family
 transfer is not insider buying, so `market_activity` and `non_market_activity`
 are aggregated separately rather than summed together.
 
-**2. Duplicate cross-reporting.** The SEC prints this caution under the table:
+**2. Withdrawn filings.** The SEC keeps revoked filings in the listing rather than
+deleting them — struck through and annotated:
+
+```html
+<span style="text-decoration: line-through">429,000</span><br/>Revoked by Reporter
+```
+
+`get_text()` yields `"429,000Revoked by Reporter"`, which no number parser
+accepts, so a naive scrape silently loses the volume while still counting the row
+as a real buy at a real price. These rows carry `is_revoked: true`, keep the
+struck figure in `shares` for reference, have a null `shares_signed`, and are
+excluded from analytics (`revoked_records_excluded`). Measured at **19 of 1,090
+rows (1.7%)** across six sampled companies.
+
+**3. Duplicate cross-reporting.** The SEC prints this caution under the table:
 
 > กรณีที่บริษัทมีผู้บริหารเป็นคู่สมรสกัน ถ้ามีการซื้อขายหลักทรัพย์ คู่สมรสทั้ง 2 คน
 > จะมีหน้าที่ต้องรายงาน ซึ่งจะทำให้เกิดการแสดงรายการซ้ำซ้อนกัน … จึงขอให้ใช้ข้อมูลด้วยความระมัดระวัง
@@ -150,6 +164,32 @@ Relationship matching is order-sensitive, because the juristic-person label
 *contains* the wording of the other categories (`ผู้จัดทำรายงาน`, `คู่สมรส`,
 `บุตรที่ยังไม่บรรลุนิติภาวะ`). `นิติบุคคล` is tested first — see the comment in
 `app/mappings.py`.
+
+A self-filing appears under **three** different wordings — `ผู้รายงาน`,
+`ผู้จัดทำรายงาน` and `ผู้จัดทำ` — and the last is the most common in practice.
+All three map to `relationship_code: "self"`.
+
+### Random-sample verification
+
+Fixed fixtures cannot catch vocabulary the parser has never seen, so
+`tests/../random_test.py`-style sampling was run against production: pick N
+companies at random from the 866, pull their full history, and flag any row whose
+`method_code` / `relationship_code` / `security_type_code` fell back to `other`
+or `unknown`.
+
+The first run (14 companies, 1,349 rows) returned **355 anomalies** and found both
+bugs above. After fixing, a fresh independent sample (16 companies, 1,685 rows)
+returned **0 anomalies**, with every row parsed completely:
+
+| Dimension | Values observed |
+|---|---|
+| `methods` | buy 958, sell 640, transfer_out 49, transfer_in 38 |
+| `relationships` | self 1409, spouse 269, juristic_person 5, child 2 |
+| `securities` | common_share 1622, warrant 50, convertible_debenture 11, preferred_share 2 |
+| `holder_types` | individual 1680, juristic_person 5 |
+
+Re-run it after any parser change; it is the only check that exercises live
+vocabulary.
 
 ## Portal constraints worth knowing
 
