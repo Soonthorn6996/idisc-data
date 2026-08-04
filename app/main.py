@@ -19,7 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from . import config
+from . import auth, config
 from .deps import build_meta
 from .http_client import BotChallengeError, NotFoundError, UpstreamError, close_client
 from .routers import company, form59, sustainability, symbols
@@ -33,11 +33,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# The MCP server is only imported when a token is configured, so a deployment
+# without MCP_AUTH_TOKEN never even constructs the endpoint.
+_mcp_asgi_app = None
+_mcp_module = None
+if auth.MCP_ENABLED:
+    from . import mcp_server as _mcp_module
+
+    _mcp_asgi_app = _mcp_module.build_mcp_asgi_app()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting SEC iDisc API against %s", config.BASE_URL)
-    yield
+    auth.log_auth_status()
+
+    if _mcp_module is not None:
+        # FastMCP's session manager must be running for the mounted Streamable
+        # HTTP app to serve requests; entering it here ties its lifetime to the
+        # parent app's.
+        async with _mcp_module.mcp.session_manager.run():
+            logger.info("MCP Streamable HTTP endpoint mounted at /mcp")
+            yield
+    else:
+        yield
+
     await close_client()
     logger.info("Shut down; HTTP client closed")
 
@@ -100,6 +120,37 @@ app.include_router(sustainability.router)
 app.include_router(symbols.router)
 app.include_router(company.router)
 
+if _mcp_asgi_app is not None:
+    # The token guard wraps the MCP app rather than being global middleware, so
+    # /health and the REST API keep working for existing callers while /mcp is
+    # closed to anyone without the shared secret.
+    app.mount("/mcp", auth.BearerTokenMiddleware(_mcp_asgi_app))
+
+
+@app.middleware("http")
+async def optional_rest_auth(request: Request, call_next):
+    """Enforce the token on REST too, when REST_AUTH_REQUIRED is enabled.
+
+    Off by default so turning on MCP does not silently break existing REST
+    consumers. ``/health`` stays open either way so platform healthchecks and
+    uptime probes keep working, and it exposes no company data.
+    """
+    if auth.REST_AUTH_REQUIRED and request.url.path not in {"/health", "/"}:
+        # /mcp is already guarded by its own mount-level middleware.
+        if not request.url.path.startswith("/mcp"):
+            headers = {k.encode("latin-1"): v.encode("latin-1")
+                       for k, v in request.headers.items()}
+            if not auth.is_authorized(headers):
+                return JSONResponse(
+                    status_code=401,
+                    headers={"WWW-Authenticate": 'Bearer realm="idisc-rest"'},
+                    content={
+                        "error": "unauthorized",
+                        "detail": "ต้องระบุ Authorization: Bearer <token>",
+                    },
+                )
+    return await call_next(request)
+
 
 @app.exception_handler(NotFoundError)
 async def not_found_handler(request: Request, exc: NotFoundError) -> JSONResponse:
@@ -153,9 +204,28 @@ async def root() -> dict:
             "symbol_lookup": "/api/v1/symbols/{symbol}",
             "company_full": "/api/v1/company/{symbol}/full",
             "health": "/health",
+            "mcp": "/mcp" if auth.MCP_ENABLED else None,
+        },
+        "mcp": {
+            "enabled": auth.MCP_ENABLED,
+            "transport": "streamable-http" if auth.MCP_ENABLED else None,
+            "endpoint": "/mcp" if auth.MCP_ENABLED else None,
+            "auth": "Authorization: Bearer <token>" if auth.MCP_ENABLED else None,
+            "tools": sorted(_MCP_TOOL_NAMES) if auth.MCP_ENABLED else [],
         },
         "disclaimer": config.DISCLAIMER,
     }
+
+
+# Listed statically so the root endpoint can advertise them without awaiting the
+# MCP registry on every request.
+_MCP_TOOL_NAMES = [
+    "lookup_thai_stock",
+    "search_thai_stocks",
+    "get_form59_executive_trades",
+    "get_sustainability_ratings",
+    "compare_sustainability_ratings",
+]
 
 
 @app.get("/health", tags=["ระบบ"], summary="ตรวจสอบสถานะบริการและ cache")
@@ -163,6 +233,11 @@ async def health() -> dict:
     return {
         "status": "ok",
         "upstream": config.BASE_URL,
+        "mcp_enabled": auth.MCP_ENABLED,
+        # A fingerprint, never the token itself - lets an operator confirm which
+        # secret is loaded without exposing it.
+        "mcp_token_fingerprint": auth.token_fingerprint(),
+        "rest_auth_required": auth.REST_AUTH_REQUIRED,
         "caches": [
             *symbol_registry.cache_stats(),
             form59_service.cache_stats(),
