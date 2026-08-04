@@ -57,6 +57,40 @@ BULK_CONCURRENCY = int(os.environ.get("SEC_BULK_CONCURRENCY", "2"))
 # (it exposes 2, 8 and A-Z); kept here as the fallback if discovery fails.
 FALLBACK_INDEX_LETTERS = ["2", "8"] + [chr(c) for c in range(ord("A"), ord("Z") + 1)]
 
+# --------------------------------------------------------------------------
+# MCP transport security
+# --------------------------------------------------------------------------
+# The MCP SDK validates the Host and Origin headers to block DNS-rebinding
+# attacks. Behind a platform proxy the public hostname must be allow-listed
+# explicitly or every request is answered with "421 Misdirected Request".
+# Railway injects RAILWAY_PUBLIC_DOMAIN, so the correct host is picked up
+# automatically; MCP_ALLOWED_HOSTS covers custom domains.
+def _csv_env(name: str) -> list[str]:
+    return [item.strip() for item in os.environ.get(name, "").split(",") if item.strip()]
+
+
+_railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+
+MCP_ALLOWED_HOSTS: list[str] = _csv_env("MCP_ALLOWED_HOSTS")
+MCP_ALLOWED_ORIGINS: list[str] = _csv_env("MCP_ALLOWED_ORIGINS")
+
+if _railway_domain:
+    MCP_ALLOWED_HOSTS += [_railway_domain, f"{_railway_domain}:443"]
+    MCP_ALLOWED_ORIGINS += [f"https://{_railway_domain}"]
+
+# Local development hosts, harmless to keep in every environment.
+for _port in ("8000", "8080", "8090", "8091"):
+    MCP_ALLOWED_HOSTS += [f"localhost:{_port}", f"127.0.0.1:{_port}"]
+MCP_ALLOWED_HOSTS += ["localhost", "127.0.0.1"]
+MCP_ALLOWED_ORIGINS += ["http://localhost", "http://127.0.0.1"]
+
+# Escape hatch: MCP_ALLOWED_HOSTS="*" turns the protection off. Documented as
+# not recommended - prefer naming the host.
+MCP_DISABLE_HOST_CHECK: bool = "*" in MCP_ALLOWED_HOSTS
+
+MCP_ALLOWED_HOSTS = sorted(set(MCP_ALLOWED_HOSTS))
+MCP_ALLOWED_ORIGINS = sorted(set(MCP_ALLOWED_ORIGINS))
+
 DISCLAIMER = (
     "การวิเคราะห์นี้เป็นเพียงการรวบรวมข้อมูลเพื่อการศึกษาเท่านั้น "
     "ไม่ใช่คำชี้ชวนในการลงทุน ผู้ลงทุนควรศึกษาข้อมูลเพิ่มเติมก่อนตัดสินใจ"

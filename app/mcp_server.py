@@ -18,6 +18,7 @@ from datetime import date, timedelta
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from . import config
 from .deps import DEFAULT_LOOKBACK_DAYS, today_bangkok
@@ -49,6 +50,15 @@ market.sec.or.th) รองรับหุ้นทุกตัวในตล�
 - ข้อมูลนี้ใช้เพื่อการศึกษาและวิเคราะห์เชิงสถิติ ไม่ใช่คำแนะนำการลงทุน
 """
 
+# DNS-rebinding protection stays ON; the deployment's public hostname is
+# allow-listed instead. Behind a proxy the Host header is the platform domain,
+# which the SDK rejects by default with "421 Misdirected Request".
+_transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=not config.MCP_DISABLE_HOST_CHECK,
+    allowed_hosts=config.MCP_ALLOWED_HOSTS,
+    allowed_origins=config.MCP_ALLOWED_ORIGINS,
+)
+
 mcp: FastMCP = FastMCP(
     name="efin-sec-idisc",
     instructions=INSTRUCTIONS,
@@ -59,6 +69,7 @@ mcp: FastMCP = FastMCP(
     # clients that do not implement the streaming path.
     json_response=True,
     streamable_http_path="/",
+    transport_security=_transport_security,
 )
 
 # Records are heavy; these bounds keep a tool result context-sized.
