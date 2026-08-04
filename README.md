@@ -196,6 +196,98 @@ All optional, via environment variables:
 | `SEC_BULK_MAX_SYMBOLS` | `50` | Max tickers per bulk request |
 | `SEC_BULK_CONCURRENCY` | `2` | Bulk fan-out width |
 
+## MCP server (for other projects to consume)
+
+The same datasets are exposed as MCP tools over **Streamable HTTP**, protected by
+a fixed shared token.
+
+```
+Endpoint : https://idisc-data-production.up.railway.app/mcp/
+Transport: streamable-http
+Auth     : Authorization: Bearer <MCP_AUTH_TOKEN>
+```
+
+Use the **trailing slash**. `/mcp` answers with a 307 to `/mcp/`; that is correct
+but only clients that follow redirects while preserving the POST body will work.
+
+### Connecting
+
+Claude Code:
+
+```bash
+claude mcp add --transport http efin-sec https://idisc-data-production.up.railway.app/mcp/ --header "Authorization: Bearer YOUR_TOKEN"
+```
+
+Any client that takes a JSON config:
+
+```json
+{
+  "mcpServers": {
+    "efin-sec": {
+      "type": "http",
+      "url": "https://idisc-data-production.up.railway.app/mcp/",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN" }
+    }
+  }
+}
+```
+
+### Tools
+
+| Tool | Purpose |
+|---|---|
+| `lookup_thai_stock` | Resolve one ticker → name, SEC id, market, sector |
+| `search_thai_stocks` | Search all 866 listed companies by name, market or sector |
+| `get_form59_executive_trades` | Form 59 filings with pre-computed analytics |
+| `get_sustainability_ratings` | CG Score, AGM Level, Thai-CAC, SET ESG |
+| `compare_sustainability_ratings` | Same indicators across up to 20 tickers |
+
+Tool results are **context-bounded**: `get_form59_executive_trades` returns
+analytics only unless `include_records=true`, caps rows at `max_records`
+(default 50, hard max 300), and states truncation explicitly in
+`records_truncation_note` — one company can hold 233 rows (~300 KB of JSON), and
+a silently shortened list would read as complete data.
+
+### Security posture
+
+| Property | Behaviour |
+|---|---|
+| **Fails closed** | Without `MCP_AUTH_TOKEN` the endpoint is never mounted. An unauthenticated MCP server cannot be exposed by accident. |
+| **Weak tokens refused** | Anything under 24 characters is rejected at startup and MCP stays off. |
+| **Constant-time compare** | `secrets.compare_digest` on **bytes** — it raises `TypeError` on non-ASCII `str`, which would turn a malformed header into a 500 instead of a 401. |
+| **Token never logged** | Only an 8-char SHA-256 prefix, also served on `/health` so you can confirm which secret is loaded. |
+| **Streaming-safe guard** | Raw ASGI middleware, not `BaseHTTPMiddleware`, which buffers and can deadlock long-lived Streamable HTTP responses. |
+| **Lifespan passthrough** | Non-HTTP scopes skip the guard, or the mounted app would never start. |
+| **DNS-rebinding protection** | Left **on**. The public host is allow-listed instead; an unrecognised `Host` still gets `421`. |
+| **Accepted headers** | `Authorization: Bearer <token>`, or `X-API-Key: <token>` for clients that can only set a custom header. |
+
+Rotate the token by updating the Railway variable and redeploying:
+
+```bash
+railway variables --set "MCP_AUTH_TOKEN=$(python -c 'import secrets;print(secrets.token_urlsafe(40))')" --service idisc-data
+```
+
+### Extra environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MCP_AUTH_TOKEN` | — | **Required to enable MCP.** Minimum 24 chars. |
+| `REST_AUTH_REQUIRED` | `false` | Also require the token on the REST API. `/health` and `/` stay open for platform healthchecks. |
+| `MCP_ALLOWED_HOSTS` | auto | Extra `Host` values, comma-separated, for custom domains. Railway's `RAILWAY_PUBLIC_DOMAIN` is picked up automatically. `*` disables the check (not recommended). |
+| `MCP_ALLOWED_ORIGINS` | auto | Extra allowed `Origin` values. |
+
+### Verified live
+
+| Check | Result |
+|---|---|
+| No token / wrong token / malformed bytes | `401` (never `500`) |
+| Unrecognised `Host` header | `421` — protection intact |
+| Valid `Bearer` / `X-API-Key` | `200` |
+| `initialize` | protocol `2025-06-18`, server `efin-sec-idisc` |
+| `tools/list` | 5 tools with full schemas |
+| `compare_sustainability_ratings` | GULF AA / EA n/a / SCB AAA — 3/3 |
+| `get_form59_executive_trades` | SCB 3/3 rows, `parse_complete: true` |
+
 ## Deployment (Railway)
 
 Live: **https://idisc-data-production.up.railway.app** — docs at `/docs`.
