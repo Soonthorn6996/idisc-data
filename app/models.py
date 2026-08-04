@@ -140,6 +140,17 @@ class Form59Record(BaseModel):
     duplicate_of_index: Optional[int] = Field(
         default=None, description="ลำดับของรายการต้นฉบับที่รายการนี้ซ้ำกับ"
     )
+    is_revoked: bool = Field(
+        default=False,
+        description=(
+            "True เมื่อผู้รายงานยกเลิกรายการนี้ภายหลัง (เว็บ ก.ล.ต. แสดงโดยขีดฆ่าจำนวนหน่วย) "
+            "จำนวนที่เคยรายงานยังคงแสดงไว้ในฟิลด์ shares เพื่ออ้างอิง "
+            "แต่ shares_signed เป็น null และค่าสรุปใน analytics ไม่นับรายการนี้"
+        ),
+    )
+    revocation_note: Optional[str] = Field(
+        default=None, description="ข้อความกำกับการยกเลิกจากเว็บ ก.ล.ต. เช่น 'Revoked by Reporter'"
+    )
 
     report_url: Optional[str] = Field(default=None, description="ลิงก์แบบรายงานฉบับเต็มบนเว็บ ก.ล.ต.")
     narrative_th: Optional[str] = Field(
@@ -176,6 +187,12 @@ class Form59Analytics(BaseModel):
     )
     duplicate_caution_th: Optional[str] = Field(
         default=None, description="คำเตือนของ ก.ล.ต. เรื่องรายการซ้ำ (มีค่าเมื่อพบรายการซ้ำ)"
+    )
+    revoked_records_excluded: int = Field(
+        default=0, description="จำนวนรายการที่ผู้รายงานยกเลิก ซึ่งถูกตัดออกจากการคำนวณ"
+    )
+    revoked_caution_th: Optional[str] = Field(
+        default=None, description="คำอธิบายเรื่องรายการที่ถูกยกเลิก (มีค่าเมื่อพบรายการดังกล่าว)"
     )
     date_range: dict[str, Optional[str]]
     market_activity: FlowSummary = Field(

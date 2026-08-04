@@ -63,6 +63,12 @@ _COUNT_RE = re.compile(r"จำนวนรายการที่พบ\s*([\d
 
 # The SEC's own warning about cross-reported (duplicated) rows, shown under the
 # table and surfaced in the API response so consumers see it too.
+REVOKED_CAUTION_TH = (
+    "พบรายการที่ผู้รายงานยกเลิกภายหลัง (Revoked by Reporter) ซึ่งเว็บ ก.ล.ต. ยังคงแสดงไว้ "
+    "โดยขีดฆ่าตัวเลขจำนวนหน่วย ระบบทำเครื่องหมาย is_revoked=true และไม่นับรวมในค่าสรุป "
+    "เนื่องจากรายการเหล่านี้ไม่มีผลต่อการถือครองจริง"
+)
+
 DUPLICATE_CAUTION_TH = (
     "กรณีที่บริษัทมีผู้บริหารเป็นคู่สมรสกัน การซื้อขายหนึ่งรายการจะถูกรายงานโดยคู่สมรสทั้งสองคน "
     "ทำให้ปรากฏเป็นรายการซ้ำซ้อนในหน้าเว็บ ก.ล.ต. ระบบได้ตรวจหาและทำเครื่องหมายรายการซ้ำไว้ "
@@ -119,6 +125,44 @@ def _cell(cells: list, columns: dict[str, int], key: str):
 def _cell_text(cells: list, columns: dict[str, int], key: str) -> Optional[str]:
     cell = _cell(cells, columns, key)
     return clean_optional(cell.get_text()) if cell is not None else None
+
+
+# A withdrawn filing is rendered with the figure struck through and annotated,
+# e.g. ``<span style="text-decoration: line-through">429,000</span><br/>Revoked
+# by Reporter``. Plain get_text() yields "429,000Revoked by Reporter", which no
+# number parser accepts - so the struck span is read on its own.
+_LINE_THROUGH_RE = re.compile(r"line-through", re.IGNORECASE)
+
+
+def _struck_span(cell):
+    return cell.find("span", style=_LINE_THROUGH_RE) if cell is not None else None
+
+
+def _cell_value_text(cells: list, columns: dict[str, int], key: str) -> Optional[str]:
+    """Numeric cell text, reading the struck-through value on revoked rows."""
+    cell = _cell(cells, columns, key)
+    if cell is None:
+        return None
+    span = _struck_span(cell)
+    if span is not None:
+        return clean_optional(span.get_text())
+    return clean_optional(cell.get_text())
+
+
+def _detect_revocation(cells: list) -> tuple[bool, Optional[str]]:
+    """Return ``(is_revoked, note)`` for a row.
+
+    The SEC keeps withdrawn filings visible in the listing rather than deleting
+    them, so they must be recognised or a cancelled trade reads as a real one.
+    """
+    for cell in cells:
+        span = _struck_span(cell)
+        if span is None:
+            continue
+        # The annotation is whatever the cell says besides the struck figure.
+        remainder = cell.get_text().replace(span.get_text(), "", 1)
+        return True, clean_optional(remainder) or "Revoked"
+    return False, None
 
 
 def parse_form59_html(html: str) -> dict[str, Any]:
@@ -189,8 +233,9 @@ def _parse_row(cells: list, columns: dict[str, int]) -> Optional[dict[str, Any]]
         return None
 
     transaction_date = parse_be_date(transaction_date_raw)
-    shares = parse_int(_cell_text(cells, columns, "volume"))
-    price = parse_float(_cell_text(cells, columns, "price"))
+    is_revoked, revocation_note = _detect_revocation(cells)
+    shares = parse_int(_cell_value_text(cells, columns, "volume"))
+    price = parse_float(_cell_value_text(cells, columns, "price"))
 
     method = map_acquisition_method(_cell_text(cells, columns, "method"))
     security = map_security_type(_cell_text(cells, columns, "security_type"))
@@ -214,8 +259,10 @@ def _parse_row(cells: list, columns: dict[str, int]) -> Optional[dict[str, Any]]
     else:
         holder_title, holder_name = split_person_title(holder_raw)
 
+    # A revoked filing has no signed effect on holdings: the reported figure is
+    # kept for reference, but left out of signed arithmetic entirely.
     shares_signed: Optional[int] = None
-    if shares is not None:
+    if shares is not None and not is_revoked:
         if method["direction"] == "acquire":
             shares_signed = shares
         elif method["direction"] == "dispose":
@@ -276,11 +323,14 @@ def _parse_row(cells: list, columns: dict[str, int]) -> Optional[dict[str, Any]]
 
         "is_potential_duplicate": False,
         "duplicate_of_index": None,
+        "is_revoked": is_revoked,
+        "revocation_note": revocation_note,
 
         "report_url": report_url,
         "narrative_th": _build_narrative(
             executive_name, holder_name, holder_is_executive, relationship,
             method, security, shares, price, format_thai_long(transaction_date),
+            is_revoked,
         ),
         # Internal, stripped before the response is returned.
         "_holder_key": _normalise_person_key(holder_raw)
@@ -309,6 +359,9 @@ def mark_duplicates(records: list[dict[str, Any]]) -> int:
     groups: dict[tuple, list[int]] = defaultdict(list)
     for index, record in enumerate(records):
         if not record.get("_holder_key") or not record.get("transaction_date"):
+            continue
+        if record.get("is_revoked"):
+            # A withdrawn row must not shadow the real filing it resembles.
             continue
         key = (
             record["_holder_key"],
@@ -350,6 +403,7 @@ def _build_narrative(
     shares: Optional[int],
     price: Optional[float],
     date_thai: Optional[str],
+    is_revoked: bool = False,
 ) -> str:
     """Compose one plain-Thai sentence per filing for direct AI consumption."""
     action = method.get("label_th") or "ทำรายการ"
@@ -376,6 +430,10 @@ def _build_narrative(
             parts.append(f"คิดเป็นมูลค่า {shares * price:,.2f} บาท")
     if date_thai:
         parts.append(f"เมื่อวันที่ {date_thai}")
+    if is_revoked:
+        # Stated first thing a reader sees, so the sentence cannot be quoted as
+        # evidence of a trade that was withdrawn.
+        return "[ยกเลิกรายการแล้ว] " + " ".join(parts) + " (ผู้รายงานยกเลิกรายการนี้ ไม่นับรวมในค่าสรุป)"
     return " ".join(parts)
 
 
@@ -394,13 +452,19 @@ def build_analytics(records: list[dict[str, Any]]) -> dict[str, Any]:
       ``non_market_activity`` are reported separately instead of being merged.
     """
     duplicates = [r for r in records if r.get("is_potential_duplicate")]
-    unique = [r for r in records if not r.get("is_potential_duplicate")]
+    revoked = [r for r in records if r.get("is_revoked")]
+    unique = [
+        r for r in records
+        if not r.get("is_potential_duplicate") and not r.get("is_revoked")
+    ]
 
     if not unique:
         return {
             "total_records": len(records),
             "records_used_in_totals": 0,
             "duplicate_records_excluded": len(duplicates),
+            "revoked_records_excluded": len(revoked),
+            "revoked_caution_th": REVOKED_CAUTION_TH if revoked else None,
             "duplicate_caution_th": DUPLICATE_CAUTION_TH if duplicates else None,
             "date_range": {"first": None, "last": None},
             "market_activity": _empty_flow(),
@@ -477,6 +541,8 @@ def build_analytics(records: list[dict[str, Any]]) -> dict[str, Any]:
         "total_records": len(records),
         "records_used_in_totals": len(unique),
         "duplicate_records_excluded": len(duplicates),
+        "revoked_records_excluded": len(revoked),
+        "revoked_caution_th": REVOKED_CAUTION_TH if revoked else None,
         "duplicate_caution_th": DUPLICATE_CAUTION_TH if duplicates else None,
         "date_range": {"first": dates[0] if dates else None, "last": dates[-1] if dates else None},
         "market_activity": market_flow,
@@ -507,7 +573,8 @@ def build_analytics(records: list[dict[str, Any]]) -> dict[str, Any]:
             for r in largest
         ],
         "activity_summary_th": _summary_sentence(
-            len(unique), market_flow, non_market_flow, dates, len(duplicates)
+            len(unique), market_flow, non_market_flow, dates,
+            len(duplicates), len(revoked),
         ),
     }
 
@@ -657,7 +724,8 @@ _DIRECTION_TH = {
 
 
 def _summary_sentence(
-    total: int, market: dict, non_market: dict, dates: list[str], duplicates: int
+    total: int, market: dict, non_market: dict, dates: list[str],
+    duplicates: int, revoked: int = 0,
 ) -> str:
     """A factual, non-advisory digest of the period."""
     period = f"ระหว่างวันที่ {dates[0]} ถึง {dates[-1]} " if dates else ""
@@ -679,8 +747,13 @@ def _summary_sentence(
             "และมีรายการที่ไม่ใช่การซื้อขายผ่านตลาด (เช่น การโอน/รับโอน) "
             f"อีก {non_market['records']:,} รายการ"
         )
+    excluded = []
     if duplicates:
-        parts.append(f"(ตัดรายการซ้ำซ้อนออก {duplicates:,} รายการ)")
+        excluded.append(f"รายการซ้ำซ้อน {duplicates:,} รายการ")
+    if revoked:
+        excluded.append(f"รายการที่ถูกยกเลิก {revoked:,} รายการ")
+    if excluded:
+        parts.append("(ไม่นับรวม " + " และ ".join(excluded) + ")")
     return " ".join(parts)
 
 

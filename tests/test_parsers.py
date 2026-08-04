@@ -172,6 +172,14 @@ class TestMappings:
         assert result["holder_type"] == "juristic_person"
         assert result["related_person"] == "บริษัท กัลฟ์ โฮลดิ้งส์ (ประเทศไทย) จำกัด"
 
+    @pytest.mark.parametrize("label", ["ผู้รายงาน", "ผู้จัดทำรายงาน", "ผู้จัดทำ"])
+    def test_all_self_filing_wordings_map_to_self(self, label):
+        """``ผู้จัดทำ`` was a quarter of the rows in a random market sample."""
+        result = map_relationship(label)
+        assert result["code"] == "self"
+        assert result["is_self"] is True
+        assert result["holder_type"] == "individual"
+
     def test_nested_parentheses_are_extracted(self):
         assert (
             extract_trailing_parenthetical("x (บริษัท ก (ประเทศไทย) จำกัด)")
@@ -396,6 +404,84 @@ class TestDuplicateDetection:
 # --------------------------------------------------------------------------
 # Sustainability parsing
 # --------------------------------------------------------------------------
+class TestRevokedFilings:
+    """The SEC keeps withdrawn filings visible, struck through, not deleted."""
+
+    REVOKED_ROW = """
+    <table id="gPP09T01">
+      <tr><th>ชื่อบริษัท</th><th>ชื่อผู้บริหาร</th><th>ความสัมพันธ์ *</th>
+          <th>ประเภทหลักทรัพย์</th><th>วันที่ได้มา/จำหน่าย</th><th>จำนวน</th>
+          <th>ราคา</th><th>วิธีการได้มา/จำหน่าย</th><th>หมายเหตุ</th></tr>
+      <tr><td>บริษัท ทดสอบ จำกัด (มหาชน) บมจ.(TEST)</td><td>นาย ทดสอบ ระบบ</td>
+          <td>ผู้จัดทำ</td><td>หุ้นสามัญ</td><td>15/01/2568</td>
+          <td><span style="text-decoration: line-through">429,000</span><br/>Revoked by Reporter</td>
+          <td>2.32</td><td>ซื้อ</td><td></td></tr>
+      <tr><td>บริษัท ทดสอบ จำกัด (มหาชน) บมจ.(TEST)</td><td>นาย ทดสอบ ระบบ</td>
+          <td>ผู้จัดทำ</td><td>หุ้นสามัญ</td><td>16/01/2568</td>
+          <td>100,000</td><td>2.50</td><td>ซื้อ</td><td></td></tr>
+    </table>
+    """
+
+    @pytest.fixture(scope="class")
+    def parsed(self):
+        return parse_form59_html(self.REVOKED_ROW)
+
+    def test_both_rows_are_kept(self, parsed):
+        # Nothing is dropped - the withdrawn filing stays visible and flagged.
+        assert parsed["parsed_count"] == 2
+
+    def test_revoked_row_is_flagged(self, parsed):
+        revoked = parsed["records"][0]
+        assert revoked["is_revoked"] is True
+        assert revoked["revocation_note"] == "Revoked by Reporter"
+
+    def test_struck_through_volume_is_still_read(self, parsed):
+        """get_text() yields "429,000Revoked by Reporter", which parses to None."""
+        assert parsed["records"][0]["shares"] == 429000
+
+    def test_revoked_row_has_no_signed_effect(self, parsed):
+        # The filing was withdrawn, so it cannot move a holdings total.
+        assert parsed["records"][0]["shares_signed"] is None
+        assert parsed["records"][1]["shares_signed"] == 100000
+
+    def test_narrative_leads_with_the_cancellation(self, parsed):
+        assert parsed["records"][0]["narrative_th"].startswith("[ยกเลิกรายการแล้ว]")
+
+    def test_normal_row_is_untouched(self, parsed):
+        normal = parsed["records"][1]
+        assert normal["is_revoked"] is False
+        assert normal["revocation_note"] is None
+
+    def test_analytics_exclude_the_revoked_row(self, parsed):
+        analytics = build_analytics(parsed["records"])
+        assert analytics["total_records"] == 2
+        assert analytics["records_used_in_totals"] == 1
+        assert analytics["revoked_records_excluded"] == 1
+        # 100,000 only - not 529,000.
+        assert analytics["market_activity"]["acquire_shares"] == 100000
+        assert analytics["revoked_caution_th"] is not None
+
+    def test_self_filing_wording_resolves(self, parsed):
+        # Same fixture also covers the ผู้จัดทำ mapping end to end.
+        assert all(r["relationship_code"] == "self" for r in parsed["records"])
+        assert all(r["holder_type"] == "individual" for r in parsed["records"])
+
+    def test_revoked_row_does_not_mask_a_similar_real_filing(self):
+        """A withdrawn row must not be treated as the canonical duplicate."""
+        rows = [
+            {"_holder_key": "A", "_executive_key": "A", "transaction_date": "2024-01-15",
+             "shares": 100, "price_per_share": 5.0, "method_code": "buy",
+             "security_type_code": "common_share", "is_revoked": True,
+             "is_potential_duplicate": False, "duplicate_of_index": None},
+            {"_holder_key": "A", "_executive_key": "B", "transaction_date": "2024-01-15",
+             "shares": 100, "price_per_share": 5.0, "method_code": "buy",
+             "security_type_code": "common_share", "is_revoked": False,
+             "is_potential_duplicate": False, "duplicate_of_index": None},
+        ]
+        assert mark_duplicates(rows) == 0
+        assert rows[1]["is_potential_duplicate"] is False
+
+
 class TestSustainabilityParsing:
     @pytest.fixture(scope="class")
     def gulf(self):
